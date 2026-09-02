@@ -39,6 +39,38 @@ make                       # g++ -O3 -march=native -pthread
 선택된 경로만 `iters`번 돌려 iter당 시간과 메모리 처리량을 출력한다. 반복은
 병렬 구간 **안**에서 돌기 때문에 측정값에 스레드 생성 비용이 섞이지 않는다.
 
+## 스윕 스크립트
+
+`sweep.sh`는 bit width, DB row 수, 스레드 수를 리스트로 받아 모든 조합을
+실행하고 실행마다 시간과 에너지를 한 줄씩 출력한다.
+
+```sh
+./sweep.sh
+B_LIST="256 1024" N_LIST="1M 8Mi" T_LIST="1 2 4 8" ITERS=20 ./sweep.sh
+CSV=out.csv ./sweep.sh          # 표와 함께 CSV로도 저장
+```
+
+| 변수 | 기본값 | 뜻 |
+|---|---|---|
+| `B_LIST` | `256 512 1024` | bit width 목록 |
+| `N_LIST` | `100K 1M` | row 수 목록 (바이너리와 같은 접미사) |
+| `T_LIST` | `1 2 4` | 스레드 수 목록 |
+| `ITERS` | `10` | 조합당 반복 횟수 |
+| `CSV` | (없음) | 지정하면 결과를 CSV로도 기록 |
+| `BIN` | `./hamming` | 실행할 바이너리 |
+
+```
+bits   rows     T   kernel              ms/iter    GiB/s     pkg_J    pkg_W    dram_J   dram_W
+1024   200K     1   AVX2 vpshufb          2.782     8.57    0.2774    99.71    0.0445    16.00
+1024   200K     2   AVX2 vpshufb          0.965    24.71    0.0964    99.96    0.0154    15.99
+1024   200K     4   AVX2 vpshufb          0.449    53.13    0.0450   100.30    0.0072    16.05
+```
+
+T 컬럼은 요청한 값이 아니라 바이너리가 실제로 쓴 스레드 수다(`n`보다 크면
+줄어든다). RAPL을 읽을 수 없으면 에너지 컬럼은 `-`, DRAM 도메인이 없으면
+`n/a`가 찍힌다. 어떤 조합이 실패해도 스윕은 계속되고 그 행은 `FAILED`로
+표시되며 이유는 stderr로 나간다.
+
 ## 에너지 측정 (Intel RAPL)
 
 powercap sysfs(`/sys/class/powercap/intel-rapl:*`)에서 package와 DRAM 에너지를
