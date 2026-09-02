@@ -7,10 +7,11 @@ Hamming distance를 계산하는 C++ 토이 프로젝트.
 
 - 각 row는 `ceil(b/64)`개의 `uint64_t` 워드로 bit-packing되고, DB 전체는
   `malloc`으로 할당한 하나의 평탄한 버퍼에 저장된다.
-- 거리 계산은 `XOR` 후 popcount. 컴파일 타임에 가장 빠른 경로가 선택된다:
-  - **scalar**: `__builtin_popcountll` (CPU `POPCNT`)
-  - **AVX2**: `vpshufb` 니블 룩업 + `vpsadbw` 누적 (256비트/스텝)
+- 거리 계산은 `XOR` 후 popcount. 컴파일 타임에 가장 빠른 경로 하나가 선택되어
+  그것만 실행된다:
   - **AVX-512**: `VPOPCNTQ` (512비트/스텝, `-mavx512vpopcntdq` 지원 시)
+  - **AVX2**: `vpshufb` 니블 룩업 + `vpsadbw` 누적 (256비트/스텝)
+  - **scalar**: `__builtin_popcountll` (CPU `POPCNT`), SIMD가 없을 때의 폴백
 - 멀티스레딩은 `parallel_for` 하나로 처리한다. `[0, n)`을 스레드마다 연속된
   구간으로 나누고 각자 자기 구간의 출력만 쓰므로 락도 atomic도 없다. DB
   초기화도 같은 분할로 돌려 각 스레드가 나중에 읽을 페이지를 first-touch 한다.
@@ -35,19 +36,18 @@ make                       # g++ -O3 -march=native -pthread
 ./hamming 1024 8Mi 5 4     # ~1 GiB DB, 4 스레드
 ```
 
-scalar/vector 두 경로를 모두 돌려 전 row 결과를 교차 검증하고, pass당 시간과
-메모리 처리량을 출력한다. `iters` 반복은 병렬 구간 **안**에서 돌기 때문에
-측정값에 스레드 생성 비용이 섞이지 않는다.
+선택된 경로만 `iters`번 돌려 iter당 시간과 메모리 처리량을 출력한다. 반복은
+병렬 구간 **안**에서 돌기 때문에 측정값에 스레드 생성 비용이 섞이지 않는다.
 
 ## 에너지 측정 (Intel RAPL)
 
 powercap sysfs(`/sys/class/powercap/intel-rapl:*`)에서 package와 DRAM 에너지를
-읽어 pass당 J와 평균 W를 함께 출력한다. 소켓이 여러 개면 전부 합산하고,
+읽어 iter당 J와 평균 W를 함께 출력한다. 소켓이 여러 개면 전부 합산하고,
 `core`/`psys` 도메인은 제외한다. `RAPL_PATH`로 sysfs 경로를 바꿀 수 있다.
 
 ```
-scalar POPCNT   :    0.622 ms/pass   38.35 GiB/s
-                  pkg   0.0622 J/pass   99.96 W   dram   0.0099 J/pass   15.99 W
+AVX2 vpshufb    :    0.401 ms/iter   59.42 GiB/s
+                  pkg   0.0400 J/iter   99.78 W   dram   0.0064 J/iter   15.96 W
 ```
 
 주의할 점:

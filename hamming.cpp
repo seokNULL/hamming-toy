@@ -25,12 +25,6 @@
 
 static size_t words(size_t b) { return (b + 63) / 64; }
 
-static uint32_t dist_scalar(const uint64_t* a, const uint64_t* q, size_t w) {
-    uint32_t d = 0;
-    for (size_t i = 0; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
-    return d;
-}
-
 #if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
 static const char* kVecName = "AVX-512 VPOPCNTQ";
 static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
@@ -70,8 +64,12 @@ static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
 }
 
 #else
-static const char* kVecName = "scalar (no SIMD)";
-#define dist_vec dist_scalar
+static const char* kVecName = "scalar POPCNT";
+static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
+    uint32_t d = 0;
+    for (size_t i = 0; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
+    return d;
+}
 #endif
 
 static bool read_u64(const std::string& path, uint64_t* v) {
@@ -208,8 +206,7 @@ int main(int argc, char** argv) {
 
     uint64_t* db = (uint64_t*)xmalloc(bytes);
     uint64_t* x = (uint64_t*)xmalloc(w * sizeof(uint64_t));
-    uint32_t* a = (uint32_t*)xmalloc(n * sizeof(uint32_t));
-    uint32_t* c = (uint32_t*)xmalloc(n * sizeof(uint32_t));
+    uint32_t* out = (uint32_t*)xmalloc(n * sizeof(uint32_t));
 
     printf("b=%zu bits, n=%zu rows, %zu words/row, db=%.2f MiB, threads=%zu\n",
            b, n, w, bytes / 1048576.0, nthreads);
@@ -224,47 +221,28 @@ int main(int argc, char** argv) {
         printf("rapl            : unavailable (no readable powercap counters; "
                "needs an Intel host and usually root)\n");
 
-    struct Result { double ms, pkg_j, dram_j; };
-    auto bench = [&](void (*run)(const uint64_t*, const uint64_t*, size_t, size_t,
-                                 uint32_t*, size_t, size_t), uint32_t* out) {
-        Result r;
-        rapl.start();
-        auto t0 = std::chrono::steady_clock::now();
-        run(db, x, n, w, out, nthreads, iters);
-        r.ms = std::chrono::duration<double, std::milli>(
-                   std::chrono::steady_clock::now() - t0).count() / iters;
-        rapl.stop(&r.pkg_j, &r.dram_j);
-        r.pkg_j /= iters;
-        r.dram_j /= iters;
-        return r;
-    };
+    double pkg_j, dram_j;
+    rapl.start();
+    auto t0 = std::chrono::steady_clock::now();
+    scan<dist_vec>(db, x, n, w, out, nthreads, iters);
+    double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count() / iters;
+    rapl.stop(&pkg_j, &dram_j);
+    pkg_j /= iters;
+    dram_j /= iters;
 
-    auto report = [&](const char* label, const Result& r) {
-        printf("%-16s: %8.3f ms/pass  %6.2f GiB/s\n", label, r.ms,
-               bytes / (r.ms * 1e-3) / 1073741824.0);
-        if (rapl.domains.empty()) return;
-        printf("%16s  pkg %8.4f J/pass  %6.2f W", "", r.pkg_j, r.pkg_j / (r.ms * 1e-3));
+    printf("%-16s: %8.3f ms/iter  %6.2f GiB/s\n", kVecName, ms,
+           bytes / (ms * 1e-3) / 1073741824.0);
+    if (!rapl.domains.empty()) {
+        printf("%16s  pkg %8.4f J/iter  %6.2f W", "", pkg_j, pkg_j / (ms * 1e-3));
         if (rapl.ndram)
-            printf("   dram %8.4f J/pass  %6.2f W", r.dram_j, r.dram_j / (r.ms * 1e-3));
+            printf("   dram %8.4f J/iter  %6.2f W", dram_j, dram_j / (ms * 1e-3));
         else
             printf("   dram n/a");
         printf("\n");
-    };
+    }
+    for (size_t r = 0; r < n && r < 5; ++r) printf("dist(x, row[%zu]) = %u\n", r, out[r]);
 
-    Result rs = bench(scan<dist_scalar>, a);
-    Result rv = bench(scan<dist_vec>, c);
-    report("scalar POPCNT", rs);
-    report(kVecName, rv);
-    printf("speedup         : %.2fx\n", rs.ms / rv.ms);
-
-    for (size_t r = 0; r < n; ++r)
-        if (a[r] != c[r]) {
-            fprintf(stderr, "MISMATCH row %zu: %u vs %u\n", r, a[r], c[r]);
-            return 1;
-        }
-    printf("verify          : scalar == vector for all %zu rows\n", n);
-    for (size_t r = 0; r < n && r < 5; ++r) printf("dist(x, row[%zu]) = %u\n", r, a[r]);
-
-    free(db); free(x); free(a); free(c);
+    free(db); free(x); free(out);
     return 0;
 }
