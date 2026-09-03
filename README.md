@@ -36,11 +36,30 @@ GiB/s. 굵은 값이 각 행의 승자다.
 | 4096 | 64 | 35.4 | 59.0 | **75.2** |
 
 그래서 디스패치는 `w < 8`이면 스칼라, `8 ≤ w < 16`이면 AVX2, `w ≥ 16`이면
-AVX-512다. `VPOPCNTDQ`가 있는 CPU에서는 `w ≥ 8`에서 `VPOPCNTQ`를 쓰는데, 이
-임계값만은 실측이 아니라 추정이다(가진 하드웨어에 그 명령이 없다).
+AVX-512다. 임계값은 `hamming.cpp` 위쪽의 `W_VPOPCNT` / `W_AVX512` / `W_AVX2`
+상수이고, CPU마다 다를 수 있으니 `make bench`로 직접 재서 맞추면 된다.
 
 시도했다가 측정 결과 버린 것들: 마스크 로드로 tail 루프 제거(훨씬 느림),
 누산기 2개로 언롤(느림).
+
+### AVX-512 VPOPCNTDQ 쓰기
+
+**소스를 고칠 필요가 없다.** `VPOPCNTQ` 커널은 이미 들어 있고, 그 명령이 있는
+CPU에서 `-march=native`로 빌드하면(=그냥 `make`) 자동으로 선택된다. 확인:
+
+```sh
+make && ./hamming 1024 200K
+#  -> "AVX-512 VPOPCNTQ : ... ms/iter" 로 찍히면 쓰이는 것
+grep -o avx512_vpopcntdq /proc/cpuinfo | head -1     # CPU에 있는지
+g++ -march=native -dM -E - </dev/null | grep VPOPCNTDQ  # 컴파일러가 켜는지
+```
+
+빌드 기계와 실행 기계가 다르면 `-march=native` 대신 `-mavx512vpopcntdq`를
+명시하면 된다(단 그 바이너리는 해당 명령이 없는 CPU에서 SIGILL로 죽는다).
+
+그 CPU에서 `make test`를 돌리면 `VPOPCNTQ` 커널도 검증 대상에 자동으로 포함되고,
+`make bench`의 표에 `vpopcntq` 열이 생겨 `W_VPOPCNT`를 실측으로 정할 수 있다.
+기본값 8은 추정치다 — 이 프로젝트를 만든 CPU에는 그 명령이 없었다.
 
 ### 성능의 한계는 메모리 대역폭
 
@@ -107,10 +126,11 @@ T 컬럼은 요청한 값이 아니라 바이너리가 실제로 쓴 스레드 �
 `n/a`가 찍힌다. 어떤 조합이 실패해도 스윕은 계속되고 그 행은 `FAILED`로
 표시되며 이유는 stderr로 나간다.
 
-## 검증
+## 검증과 커널 벤치마크
 
 ```sh
-make test
+make test     # 커널 정확성
+make bench    # 커널별 속도 비교 (./bench [threads] [MiB])
 ```
 
 `verify.cpp`는 `hamming.cpp`를 그대로 `#include` 해서 출하되는 커널을 테스트한다
@@ -120,7 +140,20 @@ make test
 tail 나머지(1~7 워드)가 전부 커버된다.
 
 `VPOPCNTQ` 경로는 컴파일만 확인됐다. 이 프로젝트를 개발한 CPU에 해당 명령이
-없어 실행하면 SIGILL이고, 에뮬레이터도 없었다.
+없어 실행하면 SIGILL이고, 에뮬레이터도 없었다. 그 명령이 있는 CPU에서는
+`make test`가 자동으로 이 커널까지 검증한다.
+
+`bench`도 `hamming.cpp`를 `#include` 해서 출하되는 커널을 그대로 잰다. 빌드에
+포함된 커널만 열로 나오므로, VPOPCNTDQ가 있는 CPU에서는 `vpopcntq` 열이 함께
+나온다. 작업셋은 캐시에 남을 크기(기본 8 MiB)로 잡아 DRAM이 아니라 커널을
+비교한다.
+
+```
+bits   w          scalar         avx2  avx512 shuf   GiB/s
+512    8           35.46        45.84        42.09
+1024   16          39.81        48.97        61.79
+4096   64          42.21        68.37        70.20
+```
 
 ## 에너지 측정 (Intel RAPL)
 

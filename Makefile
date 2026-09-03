@@ -1,12 +1,15 @@
 CXX      ?= g++
 CXXFLAGS ?= -O3 -march=native -std=c++17 -pthread -Wall -Wextra
 
-all: hamming verify
+all: hamming verify bench
 
 hamming: hamming.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 verify: verify.cpp hamming.cpp
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+bench: bench.cpp hamming.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 .PHONY: all test run clean
@@ -17,4 +20,4 @@ run: hamming
 	./hamming 1024 1M
 
 clean:
-	rm -f hamming verify
+	rm -f hamming verify bench

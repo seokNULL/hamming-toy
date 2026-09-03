@@ -174,20 +174,27 @@ static void scan(const uint64_t* db, const uint64_t* x, size_t n, size_t w,
 }
 
 // A vector kernel only pays off once a row is long enough to amortize its
-// horizontal reduction; below that, plain POPCNT wins. Thresholds are measured
-// (see README) -- the vpopcnt one is inferred, not measured on hardware.
+// horizontal reduction; below that, plain POPCNT wins. These are the row
+// lengths (in 64-bit words) at which each kernel takes over. Run `make bench`
+// to measure them on your own CPU -- W_VPOPCNT in particular is a guess, since
+// the machine this was written on has no VPOPCNTDQ.
+static const size_t W_VPOPCNT = 8;
+static const size_t W_AVX512  = 16;
+static const size_t W_AVX2    = 8;
+
 static const char* run_scan(const uint64_t* db, const uint64_t* x, size_t n, size_t w,
                             uint32_t* out, size_t nthreads, size_t iters) {
 #if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
-    if (w >= 8) { scan<dist_vpopcnt>(db, x, n, w, out, nthreads, iters);
-                  return "AVX-512 VPOPCNTQ"; }
-#elif defined(__AVX512BW__)
-    if (w >= 16) { scan<dist_avx512>(db, x, n, w, out, nthreads, iters);
-                   return "AVX-512 vpshufb"; }
+    if (w >= W_VPOPCNT) { scan<dist_vpopcnt>(db, x, n, w, out, nthreads, iters);
+                          return "AVX-512 VPOPCNTQ"; }
+#endif
+#if defined(__AVX512BW__)
+    if (w >= W_AVX512) { scan<dist_avx512>(db, x, n, w, out, nthreads, iters);
+                         return "AVX-512 vpshufb"; }
 #endif
 #if defined(__AVX2__)
-    if (w >= 8) { scan<dist_avx2>(db, x, n, w, out, nthreads, iters);
-                  return "AVX2 vpshufb"; }
+    if (w >= W_AVX2) { scan<dist_avx2>(db, x, n, w, out, nthreads, iters);
+                       return "AVX2 vpshufb"; }
 #endif
     scan<dist_scalar>(db, x, n, w, out, nthreads, iters);
     return "scalar POPCNT";
