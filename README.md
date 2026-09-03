@@ -35,9 +35,10 @@ GiB/s. 굵은 값이 각 행의 승자다.
 | 2048 | 32 | 33.4 | 49.9 | **66.5** |
 | 4096 | 64 | 35.4 | 59.0 | **75.2** |
 
-그래서 디스패치는 `w < 8`이면 스칼라, `8 ≤ w < 16`이면 AVX2, `w ≥ 16`이면
-AVX-512다. 임계값은 `hamming.cpp` 위쪽의 `W_VPOPCNT` / `W_AVX512` / `W_AVX2`
-상수이고, CPU마다 다를 수 있으니 `make bench`로 직접 재서 맞추면 된다.
+그래서 커널 하나만 골라 쓸 caller라면 `w < 8`이면 스칼라, `8 ≤ w < 16`이면
+AVX2, `w ≥ 16`이면 AVX-512다. 임계값은 `hamming.cpp` 위쪽의 `W_VPOPCNT` /
+`W_AVX512` / `W_AVX2` 상수이고, CPU마다 다를 수 있으니 `make bench`로 직접
+재서 맞추면 된다. `hamming` 자체는 커널을 고르지 않고 전부 돌려 비교한다.
 
 시도했다가 측정 결과 버린 것들: 마스크 로드로 tail 루프 제거(훨씬 느림),
 누산기 2개로 언롤(느림).
@@ -49,7 +50,7 @@ CPU에서 `-march=native`로 빌드하면(=그냥 `make`) 자동으로 선택된
 
 ```sh
 make && ./hamming 1024 200K
-#  -> "AVX-512 VPOPCNTQ : ... ms/iter" 로 찍히면 쓰이는 것
+#  -> "AVX-512 VPOPCNTQ : ... ms/iter" 줄이 나오면 쓰이는 것
 grep -o avx512_vpopcntdq /proc/cpuinfo | head -1     # CPU에 있는지
 g++ -march=native -dM -E - </dev/null | grep VPOPCNTDQ  # 컴파일러가 켜는지
 ```
@@ -86,13 +87,32 @@ make                       # g++ -O3 -march=native -pthread
 ./hamming 1024 8Mi 5 4     # ~1 GiB DB, 4 스레드
 ```
 
-선택된 경로만 `iters`번 돌려 iter당 시간과 메모리 처리량을 출력한다. 반복은
-병렬 구간 **안**에서 돌기 때문에 측정값에 스레드 생성 비용이 섞이지 않는다.
+빌드에 포함된 커널을 **전부** 같은 DB·질의로 돌려 각각 iter당 시간, 메모리
+처리량, 에너지를 출력하고, 마지막에 모든 커널의 결과가 일치하는지 대조한다.
+반복은 병렬 구간 **안**에서 돌기 때문에 측정값에 스레드 생성 비용이 섞이지
+않는다.
+
+```
+b=1024 bits, n=200000 rows, 16 words/row, db=24.41 MiB, threads=4
+AVX-512 vpshufb :    0.560 ms/iter   42.57 GiB/s   <- dispatch would pick this
+                  pkg   0.0553 J/iter   98.82 W   dram   0.0089 J/iter   15.81 W
+AVX2 vpshufb    :    0.561 ms/iter   42.52 GiB/s
+                  pkg   0.0566 J/iter  100.96 W   dram   0.0091 J/iter   16.15 W
+scalar POPCNT   :    0.737 ms/iter   32.33 GiB/s
+                  pkg   0.0735 J/iter   99.65 W   dram   0.0118 J/iter   15.94 W
+verify          : all kernels agree on all 200000 rows
+```
+
+VPOPCNTDQ가 있는 CPU에서는 `AVX-512 VPOPCNTQ` 줄이 맨 위에 하나 더 붙어 네 개가
+나온다. `<- dispatch would pick this` 표시는 아래 임계값이 고를 커널을 가리키는
+것이라, 실제로 가장 빠른 줄과 어긋나면 임계값을 손볼 때가 됐다는 신호다.
 
 ## 스윕 스크립트
 
 `sweep.sh`는 bit width, DB row 수, 스레드 수를 리스트로 받아 모든 조합을
-실행하고 실행마다 시간과 에너지를 한 줄씩 출력한다.
+실행하고 실행마다 시간과 에너지를 한 줄씩 출력한다. 바이너리가 커널을 전부
+돌리므로 스윕은 그중 **가장 빠른 커널**의 값을 보고하고, kernel 열이 어느
+커널이 이겼는지 알려준다.
 
 ```sh
 ./sweep.sh

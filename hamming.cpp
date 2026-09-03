@@ -175,30 +175,72 @@ static void scan(const uint64_t* db, const uint64_t* x, size_t n, size_t w,
 
 // A vector kernel only pays off once a row is long enough to amortize its
 // horizontal reduction; below that, plain POPCNT wins. These are the row
-// lengths (in 64-bit words) at which each kernel takes over. Run `make bench`
-// to measure them on your own CPU -- W_VPOPCNT in particular is a guess, since
-// the machine this was written on has no VPOPCNTDQ.
+// lengths (in 64-bit words) at which each kernel takes over -- what a caller
+// that wanted just one kernel should pick. Run `make bench` to measure them on
+// your own CPU; W_VPOPCNT in particular is a guess, since the machine this was
+// written on has no VPOPCNTDQ.
 static const size_t W_VPOPCNT = 8;
 static const size_t W_AVX512  = 16;
 static const size_t W_AVX2    = 8;
 
-static const char* run_scan(const uint64_t* db, const uint64_t* x, size_t n, size_t w,
-                            uint32_t* out, size_t nthreads, size_t iters) {
+static const char* dispatch_pick(size_t w) {
 #if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
-    if (w >= W_VPOPCNT) { scan<dist_vpopcnt>(db, x, n, w, out, nthreads, iters);
-                          return "AVX-512 VPOPCNTQ"; }
+    if (w >= W_VPOPCNT) return "AVX-512 VPOPCNTQ";
 #endif
 #if defined(__AVX512BW__)
-    if (w >= W_AVX512) { scan<dist_avx512>(db, x, n, w, out, nthreads, iters);
-                         return "AVX-512 vpshufb"; }
+    if (w >= W_AVX512) return "AVX-512 vpshufb";
 #endif
 #if defined(__AVX2__)
-    if (w >= W_AVX2) { scan<dist_avx2>(db, x, n, w, out, nthreads, iters);
-                       return "AVX2 vpshufb"; }
+    if (w >= W_AVX2) return "AVX2 vpshufb";
 #endif
-    scan<dist_scalar>(db, x, n, w, out, nthreads, iters);
+    (void)w;
     return "scalar POPCNT";
 }
+
+// Times every kernel this build contains over the same DB and query, and
+// checks they all produce the same distances.
+struct Bench {
+    const uint64_t *db, *x;
+    uint32_t *out, *ref;
+    size_t n, w, nthreads, iters, bytes;
+    Rapl* rapl;
+    const char* pick;
+    bool have_ref = false;
+    size_t mismatch = 0;
+
+    template <uint32_t Dist(const uint64_t*, const uint64_t*, size_t)>
+    void run(const char* name) {
+        double pkg_j, dram_j;
+        rapl->start();
+        auto t0 = std::chrono::steady_clock::now();
+        scan<Dist>(db, x, n, w, out, nthreads, iters);
+        double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count() / iters;
+        rapl->stop(&pkg_j, &dram_j);
+        pkg_j /= iters;
+        dram_j /= iters;
+
+        printf("%-16s: %8.3f ms/iter  %6.2f GiB/s%s\n", name, ms,
+               bytes / (ms * 1e-3) / 1073741824.0,
+               strcmp(name, pick) == 0 ? "   <- dispatch would pick this" : "");
+        if (!rapl->domains.empty()) {
+            printf("%16s  pkg %8.4f J/iter  %6.2f W", "", pkg_j, pkg_j / (ms * 1e-3));
+            if (rapl->ndram)
+                printf("   dram %8.4f J/iter  %6.2f W", dram_j, dram_j / (ms * 1e-3));
+            else
+                printf("   dram n/a");
+            printf("\n");
+        }
+
+        if (!have_ref) {
+            memcpy(ref, out, n * sizeof(uint32_t));
+            have_ref = true;
+        } else {
+            for (size_t r = 0; r < n; ++r)
+                if (out[r] != ref[r]) ++mismatch;
+        }
+    }
+};
 
 static void fill(uint64_t* rows, size_t r0, size_t r1, size_t w, size_t b, uint64_t seed) {
     std::mt19937_64 rng(seed);
@@ -251,6 +293,7 @@ int main(int argc, char** argv) {
     uint64_t* db = (uint64_t*)xmalloc(bytes);
     uint64_t* x = (uint64_t*)xmalloc(w * sizeof(uint64_t));
     uint32_t* out = (uint32_t*)xmalloc(n * sizeof(uint32_t));
+    uint32_t* ref = (uint32_t*)xmalloc(n * sizeof(uint32_t));
 
     printf("b=%zu bits, n=%zu rows, %zu words/row, db=%.2f MiB, threads=%zu\n",
            b, n, w, bytes / 1048576.0, nthreads);
@@ -265,28 +308,26 @@ int main(int argc, char** argv) {
         printf("rapl            : unavailable (no readable powercap counters; "
                "needs an Intel host and usually root)\n");
 
-    double pkg_j, dram_j;
-    rapl.start();
-    auto t0 = std::chrono::steady_clock::now();
-    const char* kern = run_scan(db, x, n, w, out, nthreads, iters);
-    double ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t0).count() / iters;
-    rapl.stop(&pkg_j, &dram_j);
-    pkg_j /= iters;
-    dram_j /= iters;
+    Bench bs{db, x, out, ref, n, w, nthreads, iters, bytes, &rapl, dispatch_pick(w)};
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
+    bs.run<dist_vpopcnt>("AVX-512 VPOPCNTQ");
+#endif
+#if defined(__AVX512BW__)
+    bs.run<dist_avx512>("AVX-512 vpshufb");
+#endif
+#if defined(__AVX2__)
+    bs.run<dist_avx2>("AVX2 vpshufb");
+#endif
+    bs.run<dist_scalar>("scalar POPCNT");
 
-    printf("%-16s: %8.3f ms/iter  %6.2f GiB/s\n", kern, ms,
-           bytes / (ms * 1e-3) / 1073741824.0);
-    if (!rapl.domains.empty()) {
-        printf("%16s  pkg %8.4f J/iter  %6.2f W", "", pkg_j, pkg_j / (ms * 1e-3));
-        if (rapl.ndram)
-            printf("   dram %8.4f J/iter  %6.2f W", dram_j, dram_j / (ms * 1e-3));
-        else
-            printf("   dram n/a");
-        printf("\n");
+    if (bs.mismatch) {
+        fprintf(stderr, "MISMATCH: %zu rows differ between kernels\n", bs.mismatch);
+        return 1;
     }
-    for (size_t r = 0; r < n && r < 5; ++r) printf("dist(x, row[%zu]) = %u\n", r, out[r]);
+    printf("verify          : all kernels agree on all %zu rows\n", n);
 
-    free(db); free(x); free(out);
+    for (size_t r = 0; r < n && r < 5; ++r) printf("dist(x, row[%zu]) = %u\n", r, ref[r]);
+
+    free(db); free(x); free(out); free(ref);
     return 0;
 }

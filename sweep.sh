@@ -7,8 +7,9 @@
 #   CSV=out.csv ./sweep.sh
 #
 # Row counts take the binary's size suffixes (1K/1M/1G, 1Ki/1Mi/1Gi).
-# Each combination runs REPS times and the fastest run is reported; single runs
-# on a shared machine vary by tens of percent.
+# The binary times every kernel it was built with; the sweep reports the fastest
+# of them. Each combination runs REPS times and the fastest run is reported;
+# single runs on a shared machine vary by tens of percent.
 # RAPL usually needs root; without it the energy columns show "-".
 
 set -u
@@ -38,24 +39,32 @@ for b in $B_LIST; do
       for _ in $(seq "$REPS"); do
         if ! out=$("$BIN" "$b" "$n" "$ITERS" "$t" 2>&1); then failed=$out; break; fi
         parsed=$(echo "$out" | awk '
+        function flush() {
+          if (!pending) return
+          if (cg + 0 > bg + 0) { bg = cg; bk = ck; bm = cm
+                                 bpj = cpj; bpw = cpw; bdj = cdj; bdw = cdw }
+          pending = 0
+        }
+        # One block per kernel: a "ms/iter" line, optionally an energy line.
         /ms\/iter/ {
-          split($0, a, ":"); kern = a[1]; sub(/ +$/, "", kern)
+          flush()
+          split($0, a, ":"); ck = a[1]; sub(/ +$/, "", ck)
           for (i = 1; i <= NF; i++) {
-            if ($i == "ms/iter") ms  = $(i-1)
-            if ($i == "GiB/s")   gib = $(i-1)
+            if ($i == "ms/iter") cm = $(i-1)
+            if ($i == "GiB/s")   cg = $(i-1)
           }
+          cpj = "-"; cpw = "-"; cdj = "-"; cdw = "-"; pending = 1
         }
         / pkg / {
           for (i = 1; i <= NF; i++) {
-            if ($i == "pkg")  { pj = $(i+1); pw = $(i+3) }
-            if ($i == "dram") { if ($(i+1) == "n/a") { dj = "n/a"; dw = "n/a" }
-                                else                 { dj = $(i+1); dw = $(i+3) } }
+            if ($i == "pkg")  { cpj = $(i+1); cpw = $(i+3) }
+            if ($i == "dram") { if ($(i+1) == "n/a") { cdj = "n/a"; cdw = "n/a" }
+                                else                 { cdj = $(i+1); cdw = $(i+3) } }
           }
         }
         END {
-          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", kern, ms, gib,
-                 (pj == "" ? "-" : pj), (pw == "" ? "-" : pw),
-                 (dj == "" ? "-" : dj), (dw == "" ? "-" : dw)
+          flush()
+          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", bk, bm, bg, bpj, bpw, bdj, bdw
         }')
         g=$(echo "$parsed" | cut -f3)
         if awk -v a="$g" -v c="$bestgib" 'BEGIN{exit !(a>c)}'; then
