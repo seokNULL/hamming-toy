@@ -25,9 +25,14 @@
 
 static size_t words(size_t b) { return (b + 63) / 64; }
 
+static uint32_t dist_scalar(const uint64_t* a, const uint64_t* q, size_t w) {
+    uint32_t d = 0;
+    for (size_t i = 0; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
+    return d;
+}
+
 #if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
-static const char* kVecName = "AVX-512 VPOPCNTQ";
-static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
+static uint32_t dist_vpopcnt(const uint64_t* a, const uint64_t* q, size_t w) {
     __m512i acc = _mm512_setzero_si512();
     size_t i = 0;
     for (; i + 8 <= w; i += 8) {
@@ -38,36 +43,48 @@ static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
     for (; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
     return d;
 }
+#endif
 
-#elif defined(__AVX2__)
-static const char* kVecName = "AVX2 vpshufb";
-static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
-    // Byte popcount by nibble lookup, then vpsadbw sums bytes into 64-bit lanes.
+// Byte popcount by nibble lookup; vpsadbw then sums bytes into 64-bit lanes.
+#if defined(__AVX512BW__)
+static uint32_t dist_avx512(const uint64_t* a, const uint64_t* q, size_t w) {
+    const __m512i lut = _mm512_broadcast_i32x4(
+        _mm_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4));
+    const __m512i mask = _mm512_set1_epi8(0x0f);
+    const __m512i zero = _mm512_setzero_si512();
+    __m512i acc = zero;
+    size_t i = 0;
+    for (; i + 8 <= w; i += 8) {
+        __m512i v = _mm512_xor_si512(_mm512_loadu_si512(a + i), _mm512_loadu_si512(q + i));
+        __m512i lo = _mm512_shuffle_epi8(lut, _mm512_and_si512(v, mask));
+        __m512i hi = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(v, 4), mask));
+        acc = _mm512_add_epi64(acc, _mm512_sad_epu8(_mm512_add_epi8(lo, hi), zero));
+    }
+    uint32_t d = _mm512_reduce_add_epi64(acc);
+    for (; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
+    return d;
+}
+#endif
+
+#if defined(__AVX2__)
+static uint32_t dist_avx2(const uint64_t* a, const uint64_t* q, size_t w) {
     const __m256i lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
                                          0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
     const __m256i mask = _mm256_set1_epi8(0x0f);
-    __m256i acc = _mm256_setzero_si256();
+    const __m256i zero = _mm256_setzero_si256();
+    __m256i acc = zero;
     size_t i = 0;
     for (; i + 4 <= w; i += 4) {
         __m256i v = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
                                      _mm256_loadu_si256((const __m256i*)(q + i)));
         __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(v, mask));
         __m256i hi = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(v, 4), mask));
-        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_add_epi8(lo, hi),
-                                                    _mm256_setzero_si256()));
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_add_epi8(lo, hi), zero));
     }
     uint64_t l[4];
     _mm256_storeu_si256((__m256i*)l, acc);
     uint32_t d = l[0] + l[1] + l[2] + l[3];
     for (; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
-    return d;
-}
-
-#else
-static const char* kVecName = "scalar POPCNT";
-static uint32_t dist_vec(const uint64_t* a, const uint64_t* q, size_t w) {
-    uint32_t d = 0;
-    for (size_t i = 0; i < w; ++i) d += __builtin_popcountll(a[i] ^ q[i]);
     return d;
 }
 #endif
@@ -156,6 +173,26 @@ static void scan(const uint64_t* db, const uint64_t* x, size_t n, size_t w,
     });
 }
 
+// A vector kernel only pays off once a row is long enough to amortize its
+// horizontal reduction; below that, plain POPCNT wins. Thresholds are measured
+// (see README) -- the vpopcnt one is inferred, not measured on hardware.
+static const char* run_scan(const uint64_t* db, const uint64_t* x, size_t n, size_t w,
+                            uint32_t* out, size_t nthreads, size_t iters) {
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
+    if (w >= 8) { scan<dist_vpopcnt>(db, x, n, w, out, nthreads, iters);
+                  return "AVX-512 VPOPCNTQ"; }
+#elif defined(__AVX512BW__)
+    if (w >= 16) { scan<dist_avx512>(db, x, n, w, out, nthreads, iters);
+                   return "AVX-512 vpshufb"; }
+#endif
+#if defined(__AVX2__)
+    if (w >= 8) { scan<dist_avx2>(db, x, n, w, out, nthreads, iters);
+                  return "AVX2 vpshufb"; }
+#endif
+    scan<dist_scalar>(db, x, n, w, out, nthreads, iters);
+    return "scalar POPCNT";
+}
+
 static void fill(uint64_t* rows, size_t r0, size_t r1, size_t w, size_t b, uint64_t seed) {
     std::mt19937_64 rng(seed);
     // Bits past width b in the last word stay 0, so distances stay in [0, b].
@@ -224,14 +261,14 @@ int main(int argc, char** argv) {
     double pkg_j, dram_j;
     rapl.start();
     auto t0 = std::chrono::steady_clock::now();
-    scan<dist_vec>(db, x, n, w, out, nthreads, iters);
+    const char* kern = run_scan(db, x, n, w, out, nthreads, iters);
     double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count() / iters;
     rapl.stop(&pkg_j, &dram_j);
     pkg_j /= iters;
     dram_j /= iters;
 
-    printf("%-16s: %8.3f ms/iter  %6.2f GiB/s\n", kVecName, ms,
+    printf("%-16s: %8.3f ms/iter  %6.2f GiB/s\n", kern, ms,
            bytes / (ms * 1e-3) / 1073741824.0);
     if (!rapl.domains.empty()) {
         printf("%16s  pkg %8.4f J/iter  %6.2f W", "", pkg_j, pkg_j / (ms * 1e-3));

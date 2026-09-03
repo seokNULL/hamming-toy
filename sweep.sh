@@ -7,6 +7,8 @@
 #   CSV=out.csv ./sweep.sh
 #
 # Row counts take the binary's size suffixes (1K/1M/1G, 1Ki/1Mi/1Gi).
+# Each combination runs REPS times and the fastest run is reported; single runs
+# on a shared machine vary by tens of percent.
 # RAPL usually needs root; without it the energy columns show "-".
 
 set -u
@@ -16,6 +18,7 @@ B_LIST=${B_LIST:-"256 512 1024"}
 N_LIST=${N_LIST:-"100K 1M"}
 T_LIST=${T_LIST:-"1 2 4"}
 ITERS=${ITERS:-10}
+REPS=${REPS:-3}
 CSV=${CSV:-}
 
 [ -x "$BIN" ] || make || exit 1
@@ -31,13 +34,10 @@ fi
 for b in $B_LIST; do
   for n in $N_LIST; do
     for t in $T_LIST; do
-      if ! out=$("$BIN" "$b" "$n" "$ITERS" "$t" 2>&1); then
-        # shellcheck disable=SC2059
-        printf "$row" "$b" "$n" "$t" FAILED - - - - - -
-        echo "  -> $(echo "$out" | tail -1)" >&2
-        continue
-      fi
-      IFS=$'\t' read -r kern ms gib pj pw dj dw <<<"$(echo "$out" | awk '
+      best= bestout= bestgib=-1 failed=
+      for _ in $(seq "$REPS"); do
+        if ! out=$("$BIN" "$b" "$n" "$ITERS" "$t" 2>&1); then failed=$out; break; fi
+        parsed=$(echo "$out" | awk '
         /ms\/iter/ {
           split($0, a, ":"); kern = a[1]; sub(/ +$/, "", kern)
           for (i = 1; i <= NF; i++) {
@@ -56,9 +56,21 @@ for b in $B_LIST; do
           printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", kern, ms, gib,
                  (pj == "" ? "-" : pj), (pw == "" ? "-" : pw),
                  (dj == "" ? "-" : dj), (dw == "" ? "-" : dw)
-        }')"
+        }')
+        g=$(echo "$parsed" | cut -f3)
+        if awk -v a="$g" -v c="$bestgib" 'BEGIN{exit !(a>c)}'; then
+          bestgib=$g; best=$parsed; bestout=$out
+        fi
+      done
+      if [ -n "$failed" ]; then
+        # shellcheck disable=SC2059
+        printf "$row" "$b" "$n" "$t" FAILED - - - - - -
+        echo "  -> $(echo "$failed" | tail -1)" >&2
+        continue
+      fi
+      IFS=$'\t' read -r kern ms gib pj pw dj dw <<<"$best"
       # Report the thread count the binary actually used (it clamps T to n).
-      at=$(echo "$out" | sed -n 's/.*threads=\([0-9]*\).*/\1/p')
+      at=$(echo "$bestout" | sed -n 's/.*threads=\([0-9]*\).*/\1/p')
       # shellcheck disable=SC2059
       printf "$row" "$b" "$n" "${at:-$t}" "$kern" "$ms" "$gib" "$pj" "$pw" "$dj" "$dw"
       if [ -n "$CSV" ]; then
